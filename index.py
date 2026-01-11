@@ -735,6 +735,7 @@ class PriceTracker(QMainWindow):
                     if current_price > 0 and current_price <= target_price:
                         message = f"🚀 ВЫГОДНО: {name_text} за {formatted_price}"
                         self.log_message(message)
+                        row_data = id_item.data(Qt.UserRole)
                         rarity = row_data['rarity']
                         rarity_names = ["Обычный", "Необычный", "Особый", "Редкий", "Исключительный", "Легендарный"]
                         rarity_name = rarity_names[rarity] if rarity < len(rarity_names) else f"rarity={rarity}"
@@ -746,7 +747,6 @@ class PriceTracker(QMainWindow):
                                 cell.setBackground(QColor(255, 255, 0))
 
                         QApplication.beep()
-                        row_data = id_item.data(Qt.UserRole)
                         QTimer.singleShot(30000, lambda: self.reset_row_color(row_data))
                     else:
                         self.reset_row_color(id_item.data(Qt.UserRole))
@@ -1005,7 +1005,11 @@ class PriceTracker(QMainWindow):
         self.shown_stacks.clear()
 
     def copy_item_name(self, item):
-        text = item.text()
+        widget = self.notifications_list.itemWidget(item)
+        if widget:
+            text = widget.text()
+        else:
+            text = item.text()
         # Убрать timestamp: text после '] '
         if '] ' in text:
             message = text.split('] ', 1)[1]
