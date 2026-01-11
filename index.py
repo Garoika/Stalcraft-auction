@@ -26,27 +26,51 @@ class PriceChecker(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            url = f"https://eapi.stalcraft.net/ru/auction/{self.item_id}/lots?sort=buyout_price&order=asc&limit=200&additional=true"
-            headers = {"Authorization": f"Bearer {self.token}"}
-            response = requests.get(url, headers=headers, timeout=15)
-
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 5))
-                self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
-                time.sleep(retry_after)
-                self.parent.request_finished.emit()
-                return
-
-            response.raise_for_status()
-            data = response.json()
-
+            offset = 0
+            limit = 200
             min_price = None
-            if data.get('lots'):
-                for lot in data['lots']:
-                    buyout_price = lot.get('buyoutPrice', 0)
-                    if buyout_price > 0:
-                        if min_price is None or buyout_price < min_price:
-                            min_price = buyout_price
+            found = False
+            request_count = 0
+
+            while not found:
+                # Читаем актуальную редкость из таблицы перед каждым запросом
+                row_data = self.parent.table.item(self.row, 0).data(Qt.UserRole)
+                rarity = row_data['rarity'] if isinstance(row_data, dict) else 0
+
+                request_count += 1
+                url = f"https://eapi.stalcraft.net/ru/auction/{self.item_id}/lots?sort=buyout_price&order=asc&limit={limit}&offset={offset}&additional=true"
+                headers = {"Authorization": f"Bearer {self.token}"}
+                response = requests.get(url, headers=headers, timeout=15)
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 5))
+                    self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
+                    time.sleep(retry_after)
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                lots = data.get('lots', [])
+                if lots:
+                    for lot in lots:
+                        buyout_price = lot.get('buyoutPrice', 0)
+                        if buyout_price > 0:
+                            # Фильтр по редкости: только лоты выбранной редкости
+                            lot_qlt = lot.get('additional', {}).get('qlt', 0)
+                            if lot_qlt == rarity:
+                                if min_price is None or buyout_price < min_price:
+                                    min_price = buyout_price
+                                found = True  # Нашли хотя бы один лот нужной редкости, продолжаем искать минимальный среди всех
+
+                # Если меньше limit, значит конец данных
+                if len(lots) < limit:
+                    break
+
+                offset += limit
+
+            if request_count > 1:
+                print(f"DEBUG: {self.item_id} (rarity {rarity}) потребовалось {request_count} запросов")
 
             price = str(min_price) if min_price is not None else "N/A"
             self.parent.price_checked.emit(self.row, price)
@@ -337,7 +361,6 @@ class PriceTracker(QMainWindow):
 
         self.LISTING_FILE = os.path.join(self.base_dir, "listing.json")
         self.LOG_FILE = os.path.join(self.base_dir, "price_tracker.log")
-        self.TRACKED_ITEMS_FILE = os.path.join(self.base_dir, "tracked_items.json")
 
         # Очистка лога при запуске
         with open(self.LOG_FILE, 'w', encoding='utf-8') as f:
@@ -367,9 +390,9 @@ class PriceTracker(QMainWindow):
 
         self.table.blockSignals(True)
         self.load_settings()
-        self.load_tracked_items()
-        self.table.blockSignals(False)
+        self.load_tracked_items_from_db()
         self.load_target_prices()
+        self.table.blockSignals(False)
 
         self.log_message("Приложение запущено")
     
@@ -613,12 +636,28 @@ class PriceTracker(QMainWindow):
                         self.table.blockSignals(True)
                         item.setText(self.format_price(raw_price))
                         self.table.blockSignals(False)
+                    else:
+                        # Очистить цену
+                        self.save_target_price(row_id, 0)
+                        self.table.blockSignals(True)
+                        item.setText("")
+                        self.table.blockSignals(False)
     
     def save_target_price(self, row_id, price):
         try:
             db.update_target_price(row_id, int(price))
         except Exception as e:
             self.log_message(f"Ошибка сохранения целевой цены: {str(e)}")
+
+    def load_tracked_items_from_db(self):
+        """Загрузить список отслеживаемых предметов из базы данных"""
+        try:
+            tracked_items = db.get_tracked_items()
+            for id, item_id, _, target_rarity in tracked_items:
+                name = self.find_item_name(item_id)
+                self.add_item_to_table(item_id, name, existing_id=id, existing_rarity=target_rarity)
+        except Exception as e:
+            self.log_message(f"Ошибка загрузки списка предметов: {str(e)}")
 
     def load_target_prices(self):
         try:
@@ -654,12 +693,6 @@ class PriceTracker(QMainWindow):
             formatted_price = self.format_price(price)
             self.table.blockSignals(True)
             price_item = self.table.item(row, 1)
-            if price == "N/A":
-                current_text = price_item.text()
-                if current_text not in ["N/A", "---", ""]:
-                    # Keep the current price if it was already set
-                    self.table.blockSignals(False)
-                    return
             if price_item: price_item.setText(formatted_price)
             self.table.blockSignals(False)
 
@@ -702,26 +735,24 @@ class PriceTracker(QMainWindow):
                         cell.setBackground(QColor(Qt.white))
                 break
 
-    def on_rarity_changed_by_id(self, row_data, combo):
-        if isinstance(row_data, dict):
-            row_id = row_data['id']
-            item_id = row_data['item_id']
-            rarity = combo.currentIndex()
-            rarity_names = ["Обычный", "Необычный", "Особый", "Редкий", "Исключительный", "Легендарный"]
-            item_name = self.find_item_name(item_id)
-            self.log_message(f"Редкость для {item_name} изменена на {rarity_names[rarity]}")
-            # Обновить цвет
-            rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
-            combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
-            db.update_target_rarity(row_id, rarity)
-            # Обновить UserRole
-            row_data['rarity'] = rarity
-            # Найти строку и обновить данные
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                if item and item.data(Qt.UserRole) is row_data:
-                    item.setData(Qt.UserRole, row_data)
-                    break
+    def on_rarity_changed_by_id(self, row, combo):
+        item = self.table.item(row, 0)
+        if item:
+            row_data = item.data(Qt.UserRole)
+            if isinstance(row_data, dict):
+                row_id = row_data['id']
+                item_id = row_data['item_id']
+                rarity = combo.currentIndex()
+                rarity_names = ["Обычный", "Необычный", "Особый", "Редкий", "Исключительный", "Легендарный"]
+                item_name = self.find_item_name(item_id)
+                self.log_message(f"Редкость для {item_name} изменена на {rarity_names[rarity]}")
+                # Обновить цвет
+                rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
+                combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
+                db.update_target_rarity(row_id, rarity)
+                # Обновить UserRole
+                row_data['rarity'] = rarity
+                item.setData(Qt.UserRole, row_data)
 
     def update_token(self):
         token = self.token_input.text().strip()
@@ -801,7 +832,7 @@ class PriceTracker(QMainWindow):
         combo.setEnabled(True)
         combo.setFocusPolicy(Qt.StrongFocus)
         combo.setStyleSheet("QComboBox { background-color: white; }")
-        combo.currentIndexChanged.connect(lambda index, row_data={'id': row_id, 'item_id': item_id}, combo=combo: self.on_rarity_changed_by_id(row_data, combo))
+        combo.currentIndexChanged.connect(lambda index, row=row, combo=combo: self.on_rarity_changed_by_id(row, combo))
         self.table.setCellWidget(row, 3, combo)
 
         self.table.blockSignals(False)
@@ -915,35 +946,8 @@ class PriceTracker(QMainWindow):
             self.log_message(f"Цикл запущен ({self.request_interval}с) - проверка цен и поиск выгодных стаков")
             self.start_price_check()
 
-    def save_tracked_items(self):
-        """Сохранить список отслеживаемых предметов с редкостями"""
-        try:
-            tracked_items = []
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                combo = self.table.cellWidget(row, 3)
-                if item and combo:
-                    item_id = item.data(Qt.UserRole)
-                    rarity = combo.currentIndex()
-                    tracked_items.append((item_id, rarity))
-            with open(self.TRACKED_ITEMS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(tracked_items, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            self.log_message(f"Ошибка сохранения списка предметов: {str(e)}")
-
-    def load_tracked_items(self):
-        """Загрузить список отслеживаемых предметов с редкостями"""
-        try:
-            tracked_items = db.get_tracked_items()
-            for id, item_id, _, target_rarity in tracked_items:
-                name = self.find_item_name(item_id)
-                self.add_item_to_table(item_id, name, existing_id=id, existing_rarity=target_rarity)
-        except Exception as e:
-            self.log_message(f"Ошибка загрузки списка предметов: {str(e)}")
-
     def closeEvent(self, event):
         self.save_settings()
-        self.save_tracked_items()
         settings = QSettings("StalcraftTools", "PriceTracker")
         settings.setValue("geometry", self.saveGeometry())
         event.accept()
