@@ -8,72 +8,74 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                             QWidget, QLabel, QPushButton, QTableWidget,
                             QTableWidgetItem, QLineEdit, QHBoxLayout,
                             QHeaderView, QMessageBox, QDialog,
-                            QListWidget, QSpinBox, QTextEdit, QAbstractItemView, QComboBox)
+                            QListWidget, QSpinBox, QTextEdit, QAbstractItemView, QComboBox, QMenu)
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QSettings, QThread, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QColor
 
 # Импорт базы данных
 from database import db
 
-class PriceChecker(QRunnable):
-    def __init__(self, row, item_id, token, parent):
+class PageChecker(QRunnable):
+    def __init__(self, row, item_id, token, target_price, offset, parent):
         super().__init__()
         self.row = row
         self.item_id = item_id
         self.token = token
+        self.target_price = target_price
+        self.offset = offset
         self.parent = parent
 
     @pyqtSlot()
     def run(self):
         try:
-            offset = 0
             limit = 200
-            min_price = None
-            found = False
-            request_count = 0
+            # Читаем актуальную редкость из таблицы перед каждым запросом
+            item = self.parent.table.item(self.row, 0)
+            if item is None:
+                return
+            row_data = item.data(Qt.UserRole)
+            rarity = row_data['rarity'] if isinstance(row_data, dict) else 0
 
-            while not found:
-                # Читаем актуальную редкость из таблицы перед каждым запросом
-                row_data = self.parent.table.item(self.row, 0).data(Qt.UserRole)
-                rarity = row_data['rarity'] if isinstance(row_data, dict) else 0
+            url = f"https://eapi.stalcraft.net/ru/auction/{self.item_id}/lots?sort=buyout_price&order=asc&limit={limit}&offset={self.offset}&additional=true"
+            headers = {"Authorization": f"Bearer {self.token}"}
+            response = requests.get(url, headers=headers, timeout=15)
 
-                request_count += 1
-                url = f"https://eapi.stalcraft.net/ru/auction/{self.item_id}/lots?sort=buyout_price&order=asc&limit={limit}&offset={offset}&additional=true"
-                headers = {"Authorization": f"Bearer {self.token}"}
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 5))
+                self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
+                time.sleep(retry_after)
+                # Retry the request
                 response = requests.get(url, headers=headers, timeout=15)
 
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 5))
-                    self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
-                    time.sleep(retry_after)
-                    continue
+            response.raise_for_status()
+            data = response.json()
 
-                response.raise_for_status()
-                data = response.json()
+            lots = data.get('lots', [])
 
-                lots = data.get('lots', [])
-                if lots:
-                    for lot in lots:
-                        buyout_price = lot.get('buyoutPrice', 0)
-                        if buyout_price > 0:
-                            # Фильтр по редкости: только лоты выбранной редкости
-                            lot_qlt = lot.get('additional', {}).get('qlt', 0)
-                            if lot_qlt == rarity:
-                                if min_price is None or buyout_price < min_price:
-                                    min_price = buyout_price
-                                found = True  # Нашли хотя бы один лот нужной редкости, продолжаем искать минимальный среди всех
+            min_price = None
+            if lots:
+                for index, lot in enumerate(lots):
+                    buyout_price = lot.get('buyoutPrice', 0)
+                    if buyout_price > 0:
+                        # Фильтр по редкости: только лоты выбранной редкости
+                        lot_qlt = lot.get('additional', {}).get('qlt', 0)
+                        if lot_qlt == rarity:
+                            if min_price is None or buyout_price < min_price:
+                                min_price = buyout_price
 
-                # Если меньше limit, значит конец данных
-                if len(lots) < limit:
-                    break
+                                    # Check for profitable stack
+                            amount = lot.get('amount', 1)
+                            if amount > 1:
+                                unit_price = buyout_price // amount
+                                if self.target_price > 0 and unit_price <= self.target_price:
+                                    position = self.offset + index
+                                    self.parent.profitable_stack_found.emit(self.item_id, buyout_price, amount, unit_price, position, self.target_price, lot['startTime'], lot['endTime'])
 
-                offset += limit
+            if min_price is not None:
+                self.parent.found_min.emit(self.row, min_price)
 
-            if request_count > 1:
-                print(f"DEBUG: {self.item_id} (rarity {rarity}) потребовалось {request_count} запросов")
-
-            price = str(min_price) if min_price is not None else "N/A"
-            self.parent.price_checked.emit(self.row, price)
+            if len(lots) == limit:
+                self.parent.next_page.emit(self.row, self.item_id, self.token, self.target_price, self.offset + limit)
 
         except requests.exceptions.RequestException as e:
             self.parent.error_occurred.emit(f"Ошибка сети для {self.item_id}: {str(e)}")
@@ -348,8 +350,12 @@ class ItemSearchDialog(QDialog):
 
 class PriceTracker(QMainWindow):
     price_checked = pyqtSignal(int, str)
+    profitable_stack_found = pyqtSignal(str, int, int, int, int, int, str, str)  # item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime
+    next_page = pyqtSignal(int, str, str, int, int)  # row, item_id, token, target_price, offset
+    found_min = pyqtSignal(int, int)  # row, price
     error_occurred = pyqtSignal(str)
     request_finished = pyqtSignal()
+    log_message_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -368,13 +374,19 @@ class PriceTracker(QMainWindow):
 
         self.request_interval = 60
         self.running_requests = 0
+        self.item_mins = {}
+        self.shown_stacks = set()
         self.timer = QTimer()
         self.timer.timeout.connect(self.start_price_check)
 
         # Связи
         self.price_checked.connect(self.update_item_price)
+        self.profitable_stack_found.connect(self.on_profitable_stack)
+        self.next_page.connect(self.launch_next_page)
+        self.found_min.connect(self.update_min)
         self.error_occurred.connect(self.log_error)
         self.request_finished.connect(self.on_request_finished)
+        self.log_message_signal.connect(self.do_log_message)
 
         self.setWindowTitle("Stalcraft Price Tracker")
         self.setMinimumSize(1000, 700)
@@ -397,6 +409,9 @@ class PriceTracker(QMainWindow):
         self.log_message("Приложение запущено")
     
     def log_message(self, message):
+        self.log_message_signal.emit(message)
+
+    def do_log_message(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] {message}"
 
@@ -598,11 +613,21 @@ class PriceTracker(QMainWindow):
         self.notifications_list = QListWidget()
         self.notifications_list.setMaximumWidth(300)
         self.notifications_list.setMinimumWidth(200)
+        self.notifications_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.notifications_list.customContextMenuRequested.connect(self.show_notification_context_menu)
+        self.notifications_list.itemDoubleClicked.connect(self.copy_item_name)
 
         # Центральный layout для таблицы и уведомлений
         central_layout = QHBoxLayout()
         central_layout.addWidget(self.table, 2)  # stretch 2
-        central_layout.addWidget(self.notifications_list, 1)
+
+        # Правый layout для уведомлений и кнопки
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(self.notifications_list)
+        clear_notifications_btn = QPushButton("Очистить уведомления")
+        clear_notifications_btn.clicked.connect(self.clear_notifications)
+        right_layout.addWidget(clear_notifications_btn)
+        central_layout.addLayout(right_layout, 1)
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -612,6 +637,7 @@ class PriceTracker(QMainWindow):
         main_layout.addLayout(btn_layout)
         main_layout.addWidget(QLabel("Отслеживаемые предметы:"))
         main_layout.addLayout(central_layout)
+
         main_layout.addWidget(QLabel("Лог:"))
         main_layout.addWidget(self.log_output)
         
@@ -717,12 +743,36 @@ class PriceTracker(QMainWindow):
                                 cell.setBackground(QColor(255, 255, 0))
 
                         QApplication.beep()
-                        QTimer.singleShot(30000, lambda: self.reset_row_color(id_item.data(Qt.UserRole)))
+                        row_data = id_item.data(Qt.UserRole)
+                        QTimer.singleShot(30000, lambda: self.reset_row_color(row_data))
                     else:
                         self.reset_row_color(id_item.data(Qt.UserRole))
                 except ValueError: pass
         except Exception as e:
             self.log_message(f"Ошибка при обновлении цены: {str(e)}")
+
+    def on_profitable_stack(self, item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime):
+        token = f"{item_id}_{buyout_price}_{amount}_{startTime}"
+        if token not in self.shown_stacks:
+            self.shown_stacks.add(token)
+            profit = (amount * target_price) - buyout_price
+            name = self.find_item_name(item_id)
+            page = position // 50 + 1
+            formatted_total = self.format_price(str(buyout_price))
+            formatted_unit = self.format_price(str(unit_price))
+            message = f"💰 ВЫГОДНЫЙ СТАК: {name} - {amount} шт. за {formatted_total} ({formatted_unit} за шт.) - Прибыль: {profit}"
+            notification_message = f"{name} (x{amount})\nЦена за стак: {buyout_price}\nЦена за шт.: {unit_price}\nСтраница {page}"
+            self.add_notification(notification_message)
+            QApplication.beep()
+
+    def launch_next_page(self, row, item_id, token, target_price, offset):
+        runnable = PageChecker(row, item_id, token, target_price, offset, self)
+        self.running_requests += 1
+        QThreadPool.globalInstance().start(runnable)
+
+    def update_min(self, row, price):
+        if row not in self.item_mins or price < self.item_mins[row]:
+            self.item_mins[row] = price
     
     def reset_row_color(self, row_data):
         """Сбросить цвет строки обратно к белому"""
@@ -866,6 +916,7 @@ class PriceTracker(QMainWindow):
         token = self.token_input.text().strip()
         thread_pool = QThreadPool.globalInstance()
         self.running_requests = 0
+        self.item_mins = {}
 
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 0)
@@ -873,9 +924,17 @@ class PriceTracker(QMainWindow):
                 row_data = item.data(Qt.UserRole)
                 if isinstance(row_data, dict):
                     item_id = row_data['item_id']
+                    target_item = self.table.item(r, 2)
+                    target_price = 0
+                    if target_item and target_item.text():
+                        target_price = int(''.join(filter(str.isdigit, target_item.text())))
                     self.running_requests += 1
-                    runnable = PriceChecker(r, item_id, token, self)
+                    runnable = PageChecker(r, item_id, token, target_price, 0, self)
                     thread_pool.start(runnable)
+
+        # Очистить показанные стаки только если нет активных запросов
+        if self.running_requests == 0:
+            self.shown_stacks.clear()
 
     def on_request_finished(self):
         self.running_requests -= 1
@@ -884,6 +943,9 @@ class PriceTracker(QMainWindow):
 
     def on_check_complete(self):
         self.log_message("Проверка цен завершена")
+        for row, price in self.item_mins.items():
+            self.price_checked.emit(row, str(price))
+        self.item_mins = {}
 
 
 
@@ -931,6 +993,36 @@ class PriceTracker(QMainWindow):
 
     def log_error(self, error_msg):
         self.log_message(f"ОШИБКА: {error_msg}")
+
+    def clear_notifications(self):
+        self.log_message("Уведомления очищены")
+        self.notifications_list.clear()
+        self.shown_stacks.clear()
+
+    def copy_item_name(self, item):
+        text = item.text()
+        # Убрать timestamp: text после '] '
+        if '] ' in text:
+            message = text.split('] ', 1)[1]
+        else:
+            message = text
+        # Извлечь название из первой строки
+        name = message.split('\n')[0]
+        # Убрать (x{amount}) если есть
+        if ' (' in name and name.endswith(')'):
+            name = name.split(' (')[0]
+        QApplication.clipboard().setText(name)
+        self.log_message(f"Название '{name}' скопировано в буфер обмена")
+
+    def show_notification_context_menu(self, position):
+        menu = QMenu()
+        buy_action = menu.addAction("✅ Купил")
+        buy_action.triggered.connect(lambda: self.mark_notification_bought(self.notifications_list.currentRow()))
+        menu.exec_(self.notifications_list.mapToGlobal(position))
+
+    def mark_notification_bought(self, row):
+        if row >= 0:
+            self.notifications_list.takeItem(row)
     
     def toggle_auto_update(self):
         if self.timer.isActive():
