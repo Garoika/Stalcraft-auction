@@ -69,7 +69,7 @@ class PageChecker(QRunnable):
                                 unit_price = buyout_price // amount
                                 if self.target_price > 0 and unit_price <= self.target_price:
                                     position = self.offset + index
-                                    self.parent.profitable_stack_found.emit(self.item_id, buyout_price, amount, unit_price, position, self.target_price, lot['startTime'], lot['endTime'])
+                                    self.parent.profitable_stack_found.emit(self.item_id, buyout_price, amount, unit_price, position, self.target_price, lot['startTime'], lot['endTime'], rarity)
 
             if min_price is not None:
                 self.parent.found_min.emit(self.row, min_price)
@@ -350,7 +350,7 @@ class ItemSearchDialog(QDialog):
 
 class PriceTracker(QMainWindow):
     price_checked = pyqtSignal(int, str)
-    profitable_stack_found = pyqtSignal(str, int, int, int, int, int, str, str)  # item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime
+    profitable_stack_found = pyqtSignal(str, int, int, int, int, int, str, str, int)  # item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime, rarity
     next_page = pyqtSignal(int, str, str, int, int)  # row, item_id, token, target_price, offset
     found_min = pyqtSignal(int, int)  # row, price
     error_occurred = pyqtSignal(str)
@@ -735,7 +735,10 @@ class PriceTracker(QMainWindow):
                     if current_price > 0 and current_price <= target_price:
                         message = f"🚀 ВЫГОДНО: {name_text} за {formatted_price}"
                         self.log_message(message)
-                        notification_message = f"{name_text}\n{formatted_price}"
+                        rarity = row_data['rarity']
+                        rarity_names = ["Обычный", "Необычный", "Особый", "Редкий", "Исключительный", "Легендарный"]
+                        rarity_name = rarity_names[rarity] if rarity < len(rarity_names) else f"rarity={rarity}"
+                        notification_message = f"{name_text}\nРедкость: {rarity_name}\n{formatted_price}"
                         self.add_notification(notification_message)
                         for col in range(self.table.columnCount()):
                             cell = self.table.item(row, col)
@@ -751,7 +754,7 @@ class PriceTracker(QMainWindow):
         except Exception as e:
             self.log_message(f"Ошибка при обновлении цены: {str(e)}")
 
-    def on_profitable_stack(self, item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime):
+    def on_profitable_stack(self, item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime, rarity):
         token = f"{item_id}_{buyout_price}_{amount}_{startTime}"
         if token not in self.shown_stacks:
             self.shown_stacks.add(token)
@@ -760,8 +763,10 @@ class PriceTracker(QMainWindow):
             page = position // 50 + 1
             formatted_total = self.format_price(str(buyout_price))
             formatted_unit = self.format_price(str(unit_price))
+            rarity_names = ["Обычный", "Необычный", "Особый", "Редкий", "Исключительный", "Легендарный"]
+            rarity_name = rarity_names[rarity] if rarity < len(rarity_names) else f"rarity={rarity}"
             message = f"💰 ВЫГОДНЫЙ СТАК: {name} - {amount} шт. за {formatted_total} ({formatted_unit} за шт.) - Прибыль: {profit}"
-            notification_message = f"{name} (x{amount})\nЦена за стак: {buyout_price}\nЦена за шт.: {unit_price}\nСтраница {page}"
+            notification_message = f"{name} (x{amount})\nРедкость: {rarity_name}\nЦена за стак: {buyout_price}\nЦена за шт.: {unit_price}\nСтраница {page}"
             self.add_notification(notification_message)
             QApplication.beep()
 
