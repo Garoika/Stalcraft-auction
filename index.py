@@ -402,9 +402,6 @@ class PriceTracker(QMainWindow):
 
         self.init_ui()
 
-        # Миграция данных из файлов в базу данных при первом запуске
-        db.migrate_from_files()
-
         # Первоначальная проверка файлов
         self.ensure_files_exist()
         self.items_data = self.load_item_data()
