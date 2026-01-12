@@ -30,23 +30,7 @@ class Database:
                 )
             ''')
 
-            # Миграция для поддержки дубликатов
-            cursor.execute("PRAGMA table_info(tracked_items)")
-            columns = cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            if 'id' not in column_names:
-                # Если нет столбца id, значит старая схема, мигрируем
-                cursor.execute("ALTER TABLE tracked_items RENAME TO tracked_items_old")
-                cursor.execute('''
-                    CREATE TABLE tracked_items (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        item_id TEXT,
-                        target_price INTEGER DEFAULT 0,
-                        target_rarity INTEGER DEFAULT 0
-                    )
-                ''')
-                cursor.execute("INSERT INTO tracked_items (item_id, target_price, target_rarity) SELECT item_id, target_price, target_rarity FROM tracked_items_old")
-                cursor.execute("DROP TABLE tracked_items_old")
+
 
             # Таблица истории цен
             cursor.execute('''
@@ -209,60 +193,7 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
-    def migrate_from_files(self):
-        """Миграция данных из файлов в базу данных"""
-        # Миграция config.json
-        config_file = 'config.json'
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    config_data = json.load(f)
-                    for key, value in config_data.items():
-                        self.set_config(key, value)
-                print(f"Мигрированы настройки из {config_file}")
-            except Exception as e:
-                print(f"Ошибка миграции {config_file}: {e}")
 
-        # Миграция items.txt и target_prices.json
-        items_file = 'items.txt'
-        target_file = 'target_prices.json'
-        target_prices = {}
-
-        if os.path.exists(target_file):
-            try:
-                with open(target_file, 'r', encoding='utf-8') as f:
-                    target_prices = json.load(f)
-            except Exception as e:
-                print(f"Ошибка чтения {target_file}: {e}")
-
-        if os.path.exists(items_file):
-            try:
-                with open(items_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        item_id = line.strip()
-                        if item_id:
-                            target_price = int(target_prices.get(item_id, 0))
-                            # Проверяем, есть ли уже предмет в базе
-                            existing = self.get_tracked_items()
-                            existing_ids = [eid for _, eid, _, _ in existing]
-                            if item_id not in existing_ids:
-                                self.add_tracked_item(item_id, target_price, 0)
-                print(f"Мигрированы предметы из {items_file} и {target_file}")
-            except Exception as e:
-                print(f"Ошибка миграции предметов: {e}")
-
-        # Миграция истории из PriceHystory/history_db.json
-        history_file = 'PriceHystory/history_db.json'
-        if os.path.exists(history_file):
-            try:
-                with open(history_file, 'r', encoding='utf-8') as f:
-                    history_data = json.load(f)
-                    for item_id, prices in history_data.items():
-                        if prices:
-                            self.add_price_history(item_id, prices)
-                    print(f"Мигрирована история цен из {history_file}")
-            except Exception as e:
-                print(f"Ошибка миграции истории: {e}")
 
 # Глобальный экземпляр базы данных
 db = Database()
