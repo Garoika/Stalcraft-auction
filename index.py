@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                             QWidget, QLabel, QPushButton, QTableWidget,
                             QTableWidgetItem, QLineEdit, QHBoxLayout,
                             QHeaderView, QMessageBox, QDialog,
-                            QListWidget, QSpinBox, QTextEdit, QAbstractItemView, QComboBox, QMenu)
+                            QListWidget, QListWidgetItem, QSpinBox, QTextEdit, QAbstractItemView, QComboBox, QMenu, QCheckBox)
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QSettings, QThread, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QColor
 
@@ -16,13 +16,14 @@ from PyQt5.QtGui import QColor
 from database import db
 
 class PageChecker(QRunnable):
-    def __init__(self, row, item_id, token, target_price, offset, parent):
+    def __init__(self, row, item_id, token, target_price, offset, enable_stacks, parent):
         super().__init__()
         self.row = row
         self.item_id = item_id
         self.token = token
         self.target_price = target_price
         self.offset = offset
+        self.enable_stacks = enable_stacks
         self.parent = parent
 
     @pyqtSlot()
@@ -65,7 +66,7 @@ class PageChecker(QRunnable):
 
                                     # Check for profitable stack
                             amount = lot.get('amount', 1)
-                            if amount > 1:
+                            if amount > 1 and self.enable_stacks:
                                 unit_price = buyout_price // amount
                                 if self.target_price > 0 and unit_price <= self.target_price:
                                     position = self.offset + index
@@ -251,10 +252,10 @@ class HistoryDialog(QDialog):
 class SettingsDialog(QDialog):
     update_db_requested = pyqtSignal()
 
-    def __init__(self, current_interval, parent=None):
+    def __init__(self, current_interval, enable_stacks, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
-        self.setFixedSize(350, 200)
+        self.setFixedSize(350, 250)
 
         layout = QVBoxLayout()
 
@@ -265,6 +266,13 @@ class SettingsDialog(QDialog):
         self.interval_spin.setSuffix(" секунд")
         self.interval_spin.setValue(current_interval)
         layout.addWidget(self.interval_spin)
+
+        layout.addSpacing(10)
+
+        # --- Stack Search Section ---
+        self.stacks_checkbox = QCheckBox("Включить поиск выгодных стаков")
+        self.stacks_checkbox.setChecked(enable_stacks)
+        layout.addWidget(self.stacks_checkbox)
 
         layout.addSpacing(10)
 
@@ -373,6 +381,7 @@ class PriceTracker(QMainWindow):
             f.write("")
 
         self.request_interval = 60
+        self.enable_stacks = True
         self.running_requests = 0
         self.item_mins = {}
         self.shown_stacks = set()
@@ -747,7 +756,7 @@ class PriceTracker(QMainWindow):
                                 cell.setBackground(QColor(255, 255, 0))
 
                         QApplication.beep()
-                        QTimer.singleShot(30000, lambda: self.reset_row_color(row_data))
+                        QTimer.singleShot(30000, lambda: self.reset_row_color_by_row(row))
                     else:
                         self.reset_row_color(id_item.data(Qt.UserRole))
                 except ValueError: pass
@@ -771,7 +780,7 @@ class PriceTracker(QMainWindow):
             QApplication.beep()
 
     def launch_next_page(self, row, item_id, token, target_price, offset):
-        runnable = PageChecker(row, item_id, token, target_price, offset, self)
+        runnable = PageChecker(row, item_id, token, target_price, offset, self.enable_stacks, self)
         self.running_requests += 1
         QThreadPool.globalInstance().start(runnable)
 
@@ -789,6 +798,13 @@ class PriceTracker(QMainWindow):
                     if cell:
                         cell.setBackground(QColor(Qt.white))
                 break
+
+    def reset_row_color_by_row(self, row):
+        """Сбросить цвет строки обратно к белому по номеру строки"""
+        for col in range(self.table.columnCount()):
+            cell = self.table.item(row, col)
+            if cell:
+                cell.setBackground(QColor(Qt.white))
 
     def on_rarity_changed_by_id(self, row, combo):
         item = self.table.item(row, 0)
@@ -815,6 +831,7 @@ class PriceTracker(QMainWindow):
     def load_settings(self):
         try:
             self.request_interval = int(db.get_config('interval', '60'))
+            self.enable_stacks = db.get_config('enable_stacks', 'True') == 'True'
             token = db.get_config('token', '')
             if token:
                 self.token_input.setText(token)
@@ -824,15 +841,17 @@ class PriceTracker(QMainWindow):
     def save_settings(self):
         try:
             db.set_config('interval', str(self.request_interval))
+            db.set_config('enable_stacks', str(self.enable_stacks))
             db.set_config('token', self.token_input.text().strip())
         except: pass
 
     def show_settings(self):
-        dialog = SettingsDialog(self.request_interval)
+        dialog = SettingsDialog(self.request_interval, self.enable_stacks)
         dialog.update_db_requested.connect(lambda: self.handle_manual_update(dialog))
 
         if dialog.exec_() == QDialog.Accepted:
             self.request_interval = dialog.interval_spin.value()
+            self.enable_stacks = dialog.stacks_checkbox.isChecked()
             self.save_settings()
             if self.timer.isActive(): self.timer.start(self.request_interval * 1000)
             self.log_message(f"Интервал изменен: {self.request_interval} сек")
@@ -934,7 +953,7 @@ class PriceTracker(QMainWindow):
                     if target_item and target_item.text():
                         target_price = int(''.join(filter(str.isdigit, target_item.text())))
                     self.running_requests += 1
-                    runnable = PageChecker(r, item_id, token, target_price, 0, self)
+                    runnable = PageChecker(r, item_id, token, target_price, 0, self.enable_stacks, self)
                     thread_pool.start(runnable)
 
         # Очистить показанные стаки только если нет активных запросов
@@ -947,7 +966,6 @@ class PriceTracker(QMainWindow):
             self.on_check_complete()
 
     def on_check_complete(self):
-        self.log_message("Проверка цен завершена")
         for row, price in self.item_mins.items():
             self.price_checked.emit(row, str(price))
         self.item_mins = {}
@@ -1031,6 +1049,26 @@ class PriceTracker(QMainWindow):
 
     def mark_notification_bought(self, row):
         if row >= 0:
+            # Get the notification text to find the item name
+            item = self.notifications_list.item(row)
+            widget = self.notifications_list.itemWidget(item)
+            if widget:
+                text = widget.text()
+            else:
+                text = item.text()
+            # Extract item name
+            if '] ' in text:
+                message = text.split('] ', 1)[1]
+            else:
+                message = text
+            name = message.split('\n')[0]
+            if ' (' in name and name.endswith(')'):
+                name = name.split(' (')[0]
+            # Find the row with this name and reset color
+            for r in range(self.table.rowCount()):
+                if self.table.item(r, 0).text() == name:
+                    self.reset_row_color_by_row(r)
+                    break
             self.notifications_list.takeItem(row)
     
     def toggle_auto_update(self):
@@ -1044,7 +1082,7 @@ class PriceTracker(QMainWindow):
                 return
             self.timer.start(self.request_interval * 1000)
             self.btn_start.setText("Остановить")
-            self.log_message(f"Цикл запущен ({self.request_interval}с) - проверка цен и поиск выгодных стаков")
+            self.log_message(f"Цикл запущен ({self.request_interval}с) - проверка цен{' и поиск выгодных стаков' if self.enable_stacks else ''}")
             self.start_price_check()
 
     def closeEvent(self, event):
