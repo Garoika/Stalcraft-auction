@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QSettings, QThread, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QColor
 
-# Импорт базы данных
 from database import db
 
 class PageChecker(QRunnable):
@@ -30,7 +29,6 @@ class PageChecker(QRunnable):
     def run(self):
         try:
             limit = 200
-            # Читаем актуальную редкость из таблицы перед каждым запросом
             item = self.parent.table.item(self.row, 0)
             if item is None:
                 return
@@ -45,7 +43,6 @@ class PageChecker(QRunnable):
                 retry_after = int(response.headers.get('Retry-After', 5))
                 self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
                 time.sleep(retry_after)
-                # Retry the request
                 response = requests.get(url, headers=headers, timeout=15)
 
             response.raise_for_status()
@@ -58,7 +55,6 @@ class PageChecker(QRunnable):
                 for index, lot in enumerate(lots):
                     buyout_price = lot.get('buyoutPrice', 0)
                     if buyout_price > 0:
-                        # Фильтр по редкости: только лоты выбранной редкости
                         lot_qlt = lot.get('additional', {}).get('qlt', 0)
                         if lot_qlt == rarity:
                             if min_price is None or buyout_price < min_price:
@@ -75,7 +71,7 @@ class PageChecker(QRunnable):
             if min_price is not None:
                 self.parent.found_min.emit(self.row, min_price)
 
-            if len(lots) == limit:
+            if len(lots) == limit and (self.enable_stacks or min_price is None):
                 self.parent.next_page.emit(self.row, self.item_id, self.token, self.target_price, self.offset + limit)
 
         except requests.exceptions.RequestException as e:
