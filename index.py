@@ -338,6 +338,34 @@ class SettingsDialog(QDialog):
             self.percentage_checkbox.setChecked(False)
         self.toggle_percentage_spin()
 
+class QuickHUD(QDialog):
+    def __init__(self, name, rarity, buyout_price, unit_price, page, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        self.label = QLabel()
+        self.label.setStyleSheet("color: red; font-size: 14px; font-weight: bold;")
+        if page > 0:
+            text = f"{name}\nРедкость: {rarity}\nЦена за стак: {buyout_price}\nЦена за шт.: {unit_price}\nСтраница: {page}"
+        else:
+            text = f"{name}\nРедкость: {rarity}\nЦена: {buyout_price}"
+        self.label.setText(text)
+        layout.addWidget(self.label)
+
+        self.setLayout(layout)
+
+        # Позиционирование в правом верхнем углу
+        screen = QApplication.primaryScreen().geometry()
+        self.move(screen.width() - self.sizeHint().width() - 10, 10)
+
+        # Таймер на исчезновение через 30 секунд
+        QTimer.singleShot(30000, self.close)
+
 class ItemSearchDialog(QDialog):
     def __init__(self, items_data, parent=None):
         super().__init__(parent)
@@ -667,7 +695,7 @@ class PriceTracker(QMainWindow):
         self.notifications_list.setMinimumWidth(200)
         self.notifications_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.notifications_list.customContextMenuRequested.connect(self.show_notification_context_menu)
-        self.notifications_list.itemDoubleClicked.connect(self.copy_item_name)
+        self.notifications_list.itemDoubleClicked.connect(self.show_quick_hud)
 
         # Центральный layout для таблицы и уведомлений
         central_layout = QHBoxLayout()
@@ -1071,7 +1099,7 @@ class PriceTracker(QMainWindow):
         self.notifications_list.clear()
         self.shown_stacks.clear()
 
-    def copy_item_name(self, item):
+    def show_quick_hud(self, item):
         widget = self.notifications_list.itemWidget(item)
         if widget:
             text = widget.text()
@@ -1089,6 +1117,26 @@ class PriceTracker(QMainWindow):
             name = name.split(' (')[0]
         QApplication.clipboard().setText(name)
         self.log_message(f"Название '{name}' скопировано в буфер обмена")
+
+        lines = message.split('\n')
+        if len(lines) == 5:  # Выгодный стак
+            name = lines[0].split(' (')[0] if ' (' in lines[0] else lines[0]
+            rarity = lines[1].split(': ')[1] if ': ' in lines[1] else lines[1]
+            buyout_price = int(lines[2].split(': ')[1]) if ': ' in lines[2] else 0
+            unit_price = int(lines[3].split(': ')[1]) if ': ' in lines[3] else 0
+            page = int(lines[4].split(' ')[1]) if len(lines[4].split(' ')) > 1 else 1
+            hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            hud.show()
+        elif len(lines) == 3:  # Обычное выгодное предложение
+            name = lines[0]
+            rarity = lines[1].split(': ')[1] if ': ' in lines[1] else lines[1]
+            price_str = lines[2]
+            buyout_price = unit_price = int(''.join(filter(str.isdigit, price_str)))
+            page = 0
+            hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            hud.show()
+        else:
+            self.log_message("Неверный формат уведомления для HUD")
 
     def show_notification_context_menu(self, position):
         menu = QMenu()
