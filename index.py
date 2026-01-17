@@ -366,6 +366,11 @@ class QuickHUD(QDialog):
         # Таймер на исчезновение через 30 секунд
         QTimer.singleShot(30000, self.close)
 
+    def closeEvent(self, event):
+        if self.parent():
+            self.parent().current_hud = None
+        super().closeEvent(event)
+
 class ItemSearchDialog(QDialog):
     def __init__(self, items_data, parent=None):
         super().__init__(parent)
@@ -456,6 +461,7 @@ class PriceTracker(QMainWindow):
         self.running_requests = 0
         self.item_mins = {}
         self.shown_stacks = set()
+        self.current_hud = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.start_price_check)
 
@@ -786,8 +792,7 @@ class PriceTracker(QMainWindow):
                             combo.blockSignals(True)
                             combo.setCurrentIndex(rarity)
                             combo.blockSignals(False)
-                            rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
-                            combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
+                            combo.setStyleSheet("QComboBox { background-color: white; }")
             self.table.blockSignals(False)
         except Exception as e:
             self.log_message(f"Ошибка загрузки целевых цен: {str(e)}")
@@ -889,8 +894,7 @@ class PriceTracker(QMainWindow):
                 item_name = self.find_item_name(item_id)
                 self.log_message(f"Редкость для {item_name} изменена на {rarity_names[rarity]}")
                 # Обновить цвет
-                rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
-                combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
+                combo.setStyleSheet("QComboBox { background-color: white; }")
                 db.update_target_rarity(row_id, rarity)
                 # Обновить UserRole
                 row_data['rarity'] = rarity
@@ -1120,12 +1124,15 @@ class PriceTracker(QMainWindow):
 
         lines = message.split('\n')
         if len(lines) == 5:  # Выгодный стак
-            name = lines[0].split(' (')[0] if ' (' in lines[0] else lines[0]
+            name = lines[0]
             rarity = lines[1].split(': ')[1] if ': ' in lines[1] else lines[1]
             buyout_price = int(lines[2].split(': ')[1]) if ': ' in lines[2] else 0
             unit_price = int(lines[3].split(': ')[1]) if ': ' in lines[3] else 0
             page = int(lines[4].split(' ')[1]) if len(lines[4].split(' ')) > 1 else 1
+            if self.current_hud:
+                self.current_hud.close()
             hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            self.current_hud = hud
             hud.show()
         elif len(lines) == 3:  # Обычное выгодное предложение
             name = lines[0]
@@ -1133,7 +1140,10 @@ class PriceTracker(QMainWindow):
             price_str = lines[2]
             buyout_price = unit_price = int(''.join(filter(str.isdigit, price_str)))
             page = 0
+            if self.current_hud:
+                self.current_hud.close()
             hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            self.current_hud = hud
             hud.show()
         else:
             self.log_message("Неверный формат уведомления для HUD")
