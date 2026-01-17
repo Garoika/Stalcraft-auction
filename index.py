@@ -1130,7 +1130,8 @@ class PriceTracker(QMainWindow):
             unit_price = int(lines[3].split(': ')[1]) if ': ' in lines[3] else 0
             page = int(lines[4].split(' ')[1]) if len(lines[4].split(' ')) > 1 else 1
             if self.current_hud:
-                self.current_hud.close()
+                self.current_hud.deleteLater()
+                self.current_hud = None
             hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
             self.current_hud = hud
             hud.show()
