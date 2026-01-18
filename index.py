@@ -1142,7 +1142,8 @@ class PriceTracker(QMainWindow):
             buyout_price = unit_price = int(''.join(filter(str.isdigit, price_str)))
             page = 0
             if self.current_hud:
-                self.current_hud.close()
+                self.current_hud.deleteLater()
+                self.current_hud = None
             hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
             self.current_hud = hud
             hud.show()
