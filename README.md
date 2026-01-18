@@ -20,6 +20,14 @@
 
 ## Установка
 
+### Через релиз (рекомендуется для большинства пользователей)
+
+1. Перейдите на страницу релизов: [Скачать последний релиз](https://github.com/Garoika/Stalcraft-auction/releases/latest)
+2. Скачайте и распакуйте архив с готовым приложением.
+3. Запустите `StalcraftPriceTracker.exe` (для Windows).
+
+### Из исходного кода (для разработчиков)
+
 1. Клонируйте репозиторий:
    ```bash
    git clone https://github.com/Garoika/Stalcraft-auction.git
