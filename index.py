@@ -12,11 +12,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QSettings, QThread, QRunnable, QThreadPool, pyqtSlot
 from PyQt5.QtGui import QColor
 
-# Импорт базы данных
 from database import db
 
 class PageChecker(QRunnable):
-    def __init__(self, row, item_id, token, target_price, offset, enable_stacks, parent):
+    def __init__(self, row, item_id, token, target_price, offset, enable_stacks, enable_percentage, percentage, parent):
         super().__init__()
         self.row = row
         self.item_id = item_id
@@ -24,13 +23,14 @@ class PageChecker(QRunnable):
         self.target_price = target_price
         self.offset = offset
         self.enable_stacks = enable_stacks
+        self.enable_percentage = enable_percentage
+        self.percentage = percentage
         self.parent = parent
 
     @pyqtSlot()
     def run(self):
         try:
             limit = 200
-            # Читаем актуальную редкость из таблицы перед каждым запросом
             item = self.parent.table.item(self.row, 0)
             if item is None:
                 return
@@ -45,7 +45,6 @@ class PageChecker(QRunnable):
                 retry_after = int(response.headers.get('Retry-After', 5))
                 self.parent.error_occurred.emit(f"Лимит запросов. Пауза {retry_after} сек.")
                 time.sleep(retry_after)
-                # Retry the request
                 response = requests.get(url, headers=headers, timeout=15)
 
             response.raise_for_status()
@@ -55,28 +54,39 @@ class PageChecker(QRunnable):
 
             min_price = None
             if lots:
-                for index, lot in enumerate(lots):
+                # First pass: find min_price
+                for lot in lots:
                     buyout_price = lot.get('buyoutPrice', 0)
                     if buyout_price > 0:
-                        # Фильтр по редкости: только лоты выбранной редкости
                         lot_qlt = lot.get('additional', {}).get('qlt', 0)
                         if lot_qlt == rarity:
                             if min_price is None or buyout_price < min_price:
                                 min_price = buyout_price
 
-                                    # Check for profitable stack
-                            amount = lot.get('amount', 1)
-                            if amount > 1 and self.enable_stacks:
-                                unit_price = buyout_price // amount
-                                if self.target_price > 0 and unit_price <= self.target_price:
-                                    position = self.offset + index
-                                    self.parent.profitable_stack_found.emit(self.item_id, buyout_price, amount, unit_price, position, self.target_price, lot['startTime'], lot['endTime'], rarity)
+                # Calculate threshold
+                threshold = self.target_price
+                if self.enable_percentage:
+                    global_min = self.parent.item_mins.get(self.row, None)
+                    if global_min and global_min > 0:
+                        threshold = int(global_min * (1 - self.percentage / 100))
+
+                # Second pass: check for profitable stacks
+                for index, lot in enumerate(lots):
+                    buyout_price = lot.get('buyoutPrice', 0)
+                    lot_qlt = lot.get('additional', {}).get('qlt', 0)
+                    if buyout_price > 0 and lot_qlt == rarity:
+                        amount = lot.get('amount', 1)
+                        if amount > 1 and (self.enable_stacks or self.enable_percentage):
+                            unit_price = buyout_price // amount
+                            if threshold > 0 and unit_price <= threshold:
+                                position = self.offset + index
+                                self.parent.profitable_stack_found.emit(self.item_id, buyout_price, amount, unit_price, position, threshold, lot['startTime'], lot['endTime'], rarity)
 
             if min_price is not None:
                 self.parent.found_min.emit(self.row, min_price)
 
-            if len(lots) == limit:
-                self.parent.next_page.emit(self.row, self.item_id, self.token, self.target_price, self.offset + limit)
+            if len(lots) == limit and ((self.enable_stacks or self.enable_percentage) or min_price is None):
+                self.parent.next_page.emit(self.row, self.item_id, self.token, self.target_price, self.offset + limit, self.enable_percentage, self.percentage)
 
         except requests.exceptions.RequestException as e:
             self.parent.error_occurred.emit(f"Ошибка сети для {self.item_id}: {str(e)}")
@@ -252,10 +262,10 @@ class HistoryDialog(QDialog):
 class SettingsDialog(QDialog):
     update_db_requested = pyqtSignal()
 
-    def __init__(self, current_interval, enable_stacks, parent=None):
+    def __init__(self, current_interval, enable_stacks, enable_percentage, percentage, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
-        self.setFixedSize(350, 250)
+        self.setFixedSize(350, 300)
 
         layout = QVBoxLayout()
 
@@ -272,7 +282,26 @@ class SettingsDialog(QDialog):
         # --- Stack Search Section ---
         self.stacks_checkbox = QCheckBox("Включить поиск выгодных стаков")
         self.stacks_checkbox.setChecked(enable_stacks)
+        self.stacks_checkbox.stateChanged.connect(self.toggle_percentage_enabled)
         layout.addWidget(self.stacks_checkbox)
+
+        layout.addSpacing(10)
+
+        # --- Percentage Search Section ---
+        self.percentage_checkbox = QCheckBox("Включить поиск по процентам ниже рыночной цены")
+        self.percentage_checkbox.setChecked(enable_percentage)
+        self.percentage_checkbox.stateChanged.connect(self.toggle_percentage_spin)
+        layout.addWidget(self.percentage_checkbox)
+
+        self.percentage_label = QLabel("Процент ниже рыночной цены:")
+        layout.addWidget(self.percentage_label)
+        self.percentage_spin = QSpinBox()
+        self.percentage_spin.setRange(1, 99)
+        self.percentage_spin.setSuffix(" %")
+        self.percentage_spin.setValue(percentage)
+        layout.addWidget(self.percentage_spin)
+
+        self.toggle_percentage_enabled()
 
         layout.addSpacing(10)
 
@@ -296,6 +325,51 @@ class SettingsDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self.setLayout(layout)
+
+    def toggle_percentage_spin(self):
+        enabled = self.percentage_checkbox.isChecked()
+        self.percentage_label.setEnabled(enabled)
+        self.percentage_spin.setEnabled(enabled)
+
+    def toggle_percentage_enabled(self):
+        stacks_enabled = self.stacks_checkbox.isChecked()
+        self.percentage_checkbox.setEnabled(stacks_enabled)
+        if not stacks_enabled:
+            self.percentage_checkbox.setChecked(False)
+        self.toggle_percentage_spin()
+
+class QuickHUD(QDialog):
+    def __init__(self, name, rarity, buyout_price, unit_price, page, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        self.label = QLabel()
+        self.label.setStyleSheet("color: red; font-size: 14px; font-weight: bold;")
+        if page > 0:
+            text = f"{name}\nРедкость: {rarity}\nЦена за стак: {buyout_price}\nЦена за шт.: {unit_price}\nСтраница: {page}"
+        else:
+            text = f"{name}\nРедкость: {rarity}\nЦена: {buyout_price}"
+        self.label.setText(text)
+        layout.addWidget(self.label)
+
+        self.setLayout(layout)
+
+        # Позиционирование в правом верхнем углу
+        screen = QApplication.primaryScreen().geometry()
+        self.move(screen.width() - self.sizeHint().width() - 10, 10)
+
+        # Таймер на исчезновение через 30 секунд
+        QTimer.singleShot(30000, self.close)
+
+    def closeEvent(self, event):
+        if self.parent():
+            self.parent().current_hud = None
+        super().closeEvent(event)
 
 class ItemSearchDialog(QDialog):
     def __init__(self, items_data, parent=None):
@@ -359,7 +433,7 @@ class ItemSearchDialog(QDialog):
 class PriceTracker(QMainWindow):
     price_checked = pyqtSignal(int, str)
     profitable_stack_found = pyqtSignal(str, int, int, int, int, int, str, str, int)  # item_id, buyout_price, amount, unit_price, position, target_price, startTime, endTime, rarity
-    next_page = pyqtSignal(int, str, str, int, int)  # row, item_id, token, target_price, offset
+    next_page = pyqtSignal(int, str, str, int, int, bool, int)  # row, item_id, token, target_price, offset, enable_percentage, percentage
     found_min = pyqtSignal(int, int)  # row, price
     error_occurred = pyqtSignal(str)
     request_finished = pyqtSignal()
@@ -382,9 +456,12 @@ class PriceTracker(QMainWindow):
 
         self.request_interval = 60
         self.enable_stacks = True
+        self.enable_percentage = False
+        self.percentage = 10
         self.running_requests = 0
         self.item_mins = {}
         self.shown_stacks = set()
+        self.current_hud = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.start_price_check)
 
@@ -405,6 +482,9 @@ class PriceTracker(QMainWindow):
         # Первоначальная проверка файлов
         self.ensure_files_exist()
         self.items_data = self.load_item_data()
+        if not self.items_data:
+            self.download_listing_file(silent=True)
+            self.items_data = self.load_item_data()
 
         self.table.blockSignals(True)
         self.load_settings()
@@ -621,7 +701,7 @@ class PriceTracker(QMainWindow):
         self.notifications_list.setMinimumWidth(200)
         self.notifications_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.notifications_list.customContextMenuRequested.connect(self.show_notification_context_menu)
-        self.notifications_list.itemDoubleClicked.connect(self.copy_item_name)
+        self.notifications_list.itemDoubleClicked.connect(self.show_quick_hud)
 
         # Центральный layout для таблицы и уведомлений
         central_layout = QHBoxLayout()
@@ -712,8 +792,7 @@ class PriceTracker(QMainWindow):
                             combo.blockSignals(True)
                             combo.setCurrentIndex(rarity)
                             combo.blockSignals(False)
-                            rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
-                            combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
+                            combo.setStyleSheet("QComboBox { background-color: white; }")
             self.table.blockSignals(False)
         except Exception as e:
             self.log_message(f"Ошибка загрузки целевых цен: {str(e)}")
@@ -776,8 +855,8 @@ class PriceTracker(QMainWindow):
             self.add_notification(notification_message)
             QApplication.beep()
 
-    def launch_next_page(self, row, item_id, token, target_price, offset):
-        runnable = PageChecker(row, item_id, token, target_price, offset, self.enable_stacks, self)
+    def launch_next_page(self, row, item_id, token, target_price, offset, enable_percentage, percentage):
+        runnable = PageChecker(row, item_id, token, target_price, offset, self.enable_stacks, enable_percentage, percentage, self)
         self.running_requests += 1
         QThreadPool.globalInstance().start(runnable)
 
@@ -815,8 +894,7 @@ class PriceTracker(QMainWindow):
                 item_name = self.find_item_name(item_id)
                 self.log_message(f"Редкость для {item_name} изменена на {rarity_names[rarity]}")
                 # Обновить цвет
-                rarity_colors = ["white", "green", "blue", "purple", "red", "gold"]
-                combo.setStyleSheet(f"QComboBox {{ background-color: {rarity_colors[rarity]}; }}")
+                combo.setStyleSheet("QComboBox { background-color: white; }")
                 db.update_target_rarity(row_id, rarity)
                 # Обновить UserRole
                 row_data['rarity'] = rarity
@@ -829,6 +907,8 @@ class PriceTracker(QMainWindow):
         try:
             self.request_interval = int(db.get_config('interval', '60'))
             self.enable_stacks = db.get_config('enable_stacks', 'True') == 'True'
+            self.enable_percentage = db.get_config('enable_percentage', 'False') == 'True'
+            self.percentage = int(db.get_config('percentage', '10'))
             token = db.get_config('token', '')
             if token:
                 self.token_input.setText(token)
@@ -839,16 +919,20 @@ class PriceTracker(QMainWindow):
         try:
             db.set_config('interval', str(self.request_interval))
             db.set_config('enable_stacks', str(self.enable_stacks))
+            db.set_config('enable_percentage', str(self.enable_percentage))
+            db.set_config('percentage', str(self.percentage))
             db.set_config('token', self.token_input.text().strip())
         except: pass
 
     def show_settings(self):
-        dialog = SettingsDialog(self.request_interval, self.enable_stacks)
+        dialog = SettingsDialog(self.request_interval, self.enable_stacks, self.enable_percentage, self.percentage)
         dialog.update_db_requested.connect(lambda: self.handle_manual_update(dialog))
 
         if dialog.exec_() == QDialog.Accepted:
             self.request_interval = dialog.interval_spin.value()
             self.enable_stacks = dialog.stacks_checkbox.isChecked()
+            self.enable_percentage = dialog.percentage_checkbox.isChecked()
+            self.percentage = dialog.percentage_spin.value()
             self.save_settings()
             if self.timer.isActive(): self.timer.start(self.request_interval * 1000)
             self.log_message(f"Интервал изменен: {self.request_interval} сек")
@@ -950,7 +1034,7 @@ class PriceTracker(QMainWindow):
                     if target_item and target_item.text():
                         target_price = int(''.join(filter(str.isdigit, target_item.text())))
                     self.running_requests += 1
-                    runnable = PageChecker(r, item_id, token, target_price, 0, self.enable_stacks, self)
+                    runnable = PageChecker(r, item_id, token, target_price, 0, self.enable_stacks, self.enable_percentage, self.percentage, self)
                     thread_pool.start(runnable)
 
         # Очистить показанные стаки только если нет активных запросов
@@ -1019,7 +1103,7 @@ class PriceTracker(QMainWindow):
         self.notifications_list.clear()
         self.shown_stacks.clear()
 
-    def copy_item_name(self, item):
+    def show_quick_hud(self, item):
         widget = self.notifications_list.itemWidget(item)
         if widget:
             text = widget.text()
@@ -1037,6 +1121,34 @@ class PriceTracker(QMainWindow):
             name = name.split(' (')[0]
         QApplication.clipboard().setText(name)
         self.log_message(f"Название '{name}' скопировано в буфер обмена")
+
+        lines = message.split('\n')
+        if len(lines) == 5:  # Выгодный стак
+            name = lines[0]
+            rarity = lines[1].split(': ')[1] if ': ' in lines[1] else lines[1]
+            buyout_price = int(lines[2].split(': ')[1]) if ': ' in lines[2] else 0
+            unit_price = int(lines[3].split(': ')[1]) if ': ' in lines[3] else 0
+            page = int(lines[4].split(' ')[1]) if len(lines[4].split(' ')) > 1 else 1
+            if self.current_hud:
+                self.current_hud.deleteLater()
+                self.current_hud = None
+            hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            self.current_hud = hud
+            hud.show()
+        elif len(lines) == 3:  # Обычное выгодное предложение
+            name = lines[0]
+            rarity = lines[1].split(': ')[1] if ': ' in lines[1] else lines[1]
+            price_str = lines[2]
+            buyout_price = unit_price = int(''.join(filter(str.isdigit, price_str)))
+            page = 0
+            if self.current_hud:
+                self.current_hud.deleteLater()
+                self.current_hud = None
+            hud = QuickHUD(name, rarity, buyout_price, unit_price, page, self)
+            self.current_hud = hud
+            hud.show()
+        else:
+            self.log_message("Неверный формат уведомления для HUD")
 
     def show_notification_context_menu(self, position):
         menu = QMenu()
@@ -1079,7 +1191,7 @@ class PriceTracker(QMainWindow):
                 return
             self.timer.start(self.request_interval * 1000)
             self.btn_start.setText("Остановить")
-            self.log_message(f"Цикл запущен ({self.request_interval}с) - проверка цен{' и поиск выгодных стаков' if self.enable_stacks else ''}")
+            self.log_message(f"Цикл запущен ({self.request_interval}с) - проверка цен{' и поиск выгодных стаков' if self.enable_stacks else ''}{', поиск по процентам' if self.enable_percentage else ''}")
             self.start_price_check()
 
     def closeEvent(self, event):

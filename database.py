@@ -116,14 +116,12 @@ class Database:
 
     def update_target_rarity(self, row_id, rarity):
         """Обновить целевую редкость"""
-        print(f"DEBUG: update_target_rarity called for {row_id} with rarity {rarity}")
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE tracked_items SET target_rarity = ? WHERE id = ?
             ''', (rarity, row_id))
             conn.commit()
-            print(f"Updated rarity for {row_id} to {rarity}")
 
     def add_price_history(self, item_id, prices):
         """Добавить записи истории цен"""
